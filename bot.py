@@ -29,7 +29,9 @@ app = Flask('')
 @app.route('/')
 def home():
     return "HindiBot is alive!"
-
+@app.route('/wakeup')
+def wakeup():
+    return "Server is awake and responding.", 200
 def run_flask():
     # Use the PORT environment variable provided by Render, default to 8080
     port = int(os.environ.get('PORT', 8080))
