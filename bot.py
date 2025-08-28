@@ -51,11 +51,12 @@ class HindiBot(discord.Client):
         super().__init__(intents=intents)
         # CommandTree holds all the application commands
         self.tree = app_commands.CommandTree(self)
+        self.temp_sound_files = {} 
 
     async def setup_hook(self):
         # This syncs the commands to your specific guild.
         # For global commands, remove the guild argument.
-        # await self.tree.sync() # Use this for global commands
+        await self.tree.sync() # Use this for global commands
         logging.info("Commands synced successfully.")
 
 # Define the necessary intents for the bot
