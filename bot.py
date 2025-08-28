@@ -6,7 +6,9 @@ import asyncio
 from flask import Flask
 from threading import Thread
 import logging
-
+import uuid
+from scrape import search_myinstants_sounds, download_mp3
+DOWNLOAD_DIR="./sounds/"
 # --- Basic Setup ---
 # It's recommended to use a logger for better debugging, especially on a server
 logging.basicConfig(level=logging.INFO)
@@ -63,6 +65,135 @@ intents.voice_states = True
 
 # Instantiate the bot
 bot = HindiBot(intents=intents)
+
+# --- Custom View for Sound Buttons ---
+class SoundButtonView(discord.ui.View):
+    def __init__(self, downloaded_sounds_info: list, original_user_id: str):
+        super().__init__(timeout=180) # Timeout after 3 minutes
+        self.downloaded_sounds_info = downloaded_sounds_info # List of {'title': '...', 'path': '...'}
+        self.original_user_id = original_user_id
+
+        # Create a button for each sound
+        for i, sound in enumerate(downloaded_sounds_info):
+            # Custom IDs are required for persistent buttons.
+            # We embed the index and a unique ID for the interaction to retrieve the sound path later.
+            custom_id = f"play_sound_{sound['unique_id']}_{i}"
+            self.add_item(discord.ui.Button(label=sound['title'], custom_id=custom_id, style=discord.ButtonStyle.primary))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Only allow the original user (or authorized user) to interact with these buttons
+        if str(interaction.user.id) != self.original_user_id and str(interaction.user.id) != AUTHORIZED_USER_ID:
+            await interaction.response.send_message("You are not authorized to use these buttons.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Stop All", style=discord.ButtonStyle.danger, custom_id="stop_all_sounds")
+    async def stop_all_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+        if voice_client and voice_client.is_playing():
+            voice_client.stop()
+            await interaction.response.send_message("Stopped current playback.", ephemeral=True)
+        else:
+            await interaction.response.send_message("No sound is currently playing.", ephemeral=True)
+
+    @discord.ui.button(label="Disconnect", style=discord.ButtonStyle.red, custom_id="disconnect_bot")
+    async def disconnect_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+        if voice_client and voice_client.is_connected():
+            await voice_client.disconnect()
+            # Clean up associated temporary files
+            self.cleanup_temp_files(interaction.message.id)
+            await interaction.response.send_message("Disconnected from voice channel.", ephemeral=True)
+            self.stop() # Stop the view as well
+        else:
+            await interaction.response.send_message("I'm not currently in a voice channel.", ephemeral=True)
+
+    # This is a dynamic callback that will handle any button not explicitly defined
+    # It catches all buttons whose custom_id starts with "play_sound_"
+    async def on_timeout(self):
+        # Remove the view when it times out
+        if self.message:
+            await self.message.edit(view=None)
+        self.cleanup_temp_files(self.message.id) # Clean up on timeout
+
+    # Placeholder for the message to edit later (set when the view is sent)
+    message: discord.Message = None
+
+    async def interaction_callback(self, interaction: discord.Interaction):
+        if interaction.custom_id.startswith("play_sound_"):
+            # Extract the index from the custom_id
+            parts = interaction.custom_id.split('_')
+            unique_id = parts[2]
+            index = int(parts[3])
+
+            if unique_id not in bot.temp_sound_files:
+                await interaction.response.send_message("This interaction is too old or the sounds are no longer available.", ephemeral=True)
+                return
+
+            sound_info = bot.temp_sound_files[unique_id][index]
+            sound_path = sound_info['path']
+            sound_title = sound_info['title']
+
+            # Check if user is in a voice channel
+            if interaction.user.voice is None:
+                await interaction.response.send_message("You need to be in a voice channel to play a sound.", ephemeral=True)
+                return
+
+            voice_channel = interaction.user.voice.channel
+            voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+
+            # Connect or move to the user's voice channel
+            try:
+                if voice_client is None:
+                    voice_client = await voice_channel.connect()
+                elif voice_client.channel != voice_channel:
+                    await voice_client.move_to(voice_channel)
+            except asyncio.TimeoutError:
+                await interaction.response.send_message("Failed to connect to the voice channel (timeout).", ephemeral=True)
+                return
+            except discord.ClientException as e:
+                await interaction.response.send_message(f"Failed to connect to the voice channel: {e}", ephemeral=True)
+                return
+
+            # Defer the response as playing can take a moment
+            await interaction.response.defer()
+
+            # Play the audio
+            if voice_client.is_playing():
+                voice_client.stop()
+            
+            try:
+                voice_client.play(discord.FFmpegPCMAudio(sound_path), after=lambda e: self.after_playback(e, sound_path))
+                await interaction.followup.send(f"Playing: `{sound_title}`")
+            except Exception as e:
+                logging.error(f"Playback Error: {e}")
+                await interaction.followup.send("An error occurred while trying to play the audio.")
+
+    def cleanup_temp_files(self, message_id):
+        # Clean up temporary files associated with this message/interaction
+        unique_id_for_this_message = None
+        for uid, sounds_list in bot.temp_sound_files.items():
+            if sounds_list and sounds_list[0]['message_id'] == message_id:
+                unique_id_for_this_message = uid
+                break
+
+        if unique_id_for_this_message:
+            for sound_info in bot.temp_sound_files.pop(unique_id_for_this_message):
+                if os.path.exists(sound_info['path']):
+                    os.remove(sound_info['path'])
+                    logging.info(f"Cleaned up temporary file: {sound_info['path']}")
+            logging.info(f"Cleaned up all temporary files for message ID {message_id}")
+
+    def after_playback(self, error, file_path):
+        if error:
+            logging.error(f"Playback error: {error}")
+        # Optionally delete the file immediately after it finishes playing if needed
+        # (Be careful with this if the bot might try to play it again quickly)
+        # if os.path.exists(file_path):
+        #     os.remove(file_path)
+        #     logging.info(f"Deleted temporary file after playback: {file_path}")
+
+
 
 @bot.event
 async def on_ready():
@@ -193,6 +324,78 @@ async def namit(interaction: discord.Interaction, text: str):
     except Exception as e:
         logging.error(f"Playback Error: {e}")
         await interaction.followup.send("An error occurred while trying to play the audio.")
+
+# --- NEW COMMAND: /searchsound ---
+@bot.tree.command(name="searchsound", description="Search Myinstants.com for sounds and play them in VC.")
+@app_commands.describe(query="The sound you want to search for (e.g., 'oh my god', 'vine boom')")
+async def searchsound(interaction: discord.Interaction, query: str):
+    # 1. Authorization Check
+    if str(interaction.user.id) != AUTHORIZED_USER_ID and str(interaction.user.id) != NAMIT_USER_ID:
+        await interaction.response.send_message("You are not authorized to use this command.", ephemeral=True)
+        return
+
+    # Defer the response because search and download can take time
+    await interaction.response.defer()
+
+    num_to_download = 3
+    # Use a unique ID for this specific interaction to manage temporary files
+    interaction_unique_id = str(uuid.uuid4())
+    temp_dir = os.path.join(DOWNLOAD_DIR, interaction_unique_id)
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    found_sounds = search_myinstants_sounds(query, num_results=num_to_download)
+    downloaded_files_info = []
+
+    if not found_sounds:
+        await interaction.followup.send(f"No sounds found for '{query}'. Please try a different query.")
+        # Clean up empty temp directory
+        if os.path.exists(temp_dir) and not os.listdir(temp_dir):
+            os.rmdir(temp_dir)
+        return
+
+    # 2. Download the top results
+    for i, sound in enumerate(found_sounds):
+        # Create a safe filename for the downloaded MP3
+        safe_title = "".join(c if c.isalnum() or c in [' ', '_', '-'] else '' for c in sound['title']).strip()
+        filename = f"{safe_title[:40].replace(' ', '_')}_{i+1}.mp3" # Limit title length for filename
+
+        # Download the MP3
+        logging.info(f"Attempting to download '{sound['title']}' to {os.path.join(temp_dir, filename)}")
+        file_path = download_mp3(sound['mp3_url'], filename, temp_dir)
+
+        if file_path:
+            downloaded_files_info.append({
+                'title': sound['title'],
+                'path': file_path,
+                'unique_id': interaction_unique_id, # Store this for button callback
+                'message_id': None # Placeholder, will be filled after sending message
+            })
+        else:
+            logging.warning(f"Failed to download sound: {sound['title']} from {sound['mp3_url']}")
+
+    if not downloaded_files_info:
+        await interaction.followup.send(f"Found sounds for '{query}', but failed to download any. Please try again later or with a different query.")
+        # Clean up empty temp directory
+        if os.path.exists(temp_dir) and not os.listdir(temp_dir):
+            os.rmdir(temp_dir)
+        return
+
+    # Store the downloaded file info in the bot's temporary storage
+    # This allows the button callback to retrieve the file path later
+    bot.temp_sound_files[interaction_unique_id] = downloaded_files_info
+
+    # 3. Create and send buttons
+    view = SoundButtonView(downloaded_files_info, str(interaction.user.id))
+    message_content = f"Here are the top {len(downloaded_files_info)} sounds for '{query}':"
+    response_message = await interaction.followup.send(message_content, view=view)
+    view.message = response_message # Store message reference for cleanup/timeout
+
+    # Update message_id in stored sound info
+    for sound in downloaded_files_info:
+        sound['message_id'] = response_message.id
+
+    # Schedule cleanup for temp files after the view times out or is explicitly stopped
+    # The cleanup is handled by the View's on_timeout and disconnect_button now
 
 
 # --- Main Execution ---
