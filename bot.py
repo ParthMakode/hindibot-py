@@ -245,7 +245,8 @@ async def hin(interaction: discord.Interaction, text: str):
         "mew": "mew.mp3",
         "gyatt": "gyatt.mp3",
         "humi": "humi.mp3",
-        "mcstan": "tmkc_mcstan.mp3"
+        "mcstan": "tmkc_mcstan.mp3",
+        "babloo":"babloo.mp3"
     }
 
     source_file = special_files.get(text.lower())
